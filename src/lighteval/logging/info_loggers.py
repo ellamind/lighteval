@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import collections
+import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -30,14 +31,17 @@ import git
 import numpy as np
 import xxhash
 
-from lighteval.logging.hierarchical_logger import hlog_warn
 from lighteval.metrics import MetricCategory
 from lighteval.metrics.stderr import get_stderr_function
-from lighteval.models.model_loader import ModelInfo
-from lighteval.models.model_output import ModelReturn
+from lighteval.models.abstract_model import ModelInfo
+from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.requests import Doc
-from lighteval.utils import as_list, is_nanotron_available, sanitize_numpy
+from lighteval.utils.imports import is_nanotron_available
+from lighteval.utils.utils import as_list, sanitize_numpy
+
+
+logger = logging.getLogger(__name__)
 
 
 if is_nanotron_available():
@@ -147,6 +151,7 @@ class GeneralConfigLogger:
         self.total_evaluation_time_secondes = str(self.end_time - self.start_time)
 
 
+@dataclass()
 class DetailsLogger:
     """Logger for the experiment details.
 
@@ -295,20 +300,24 @@ class DetailsLogger:
         hash_input_tokens: str = ""
         hash_cont_tokens: str = ""
 
-    hashes: dict[str, list[Hash]] = collections.defaultdict(list)
-    compiled_hashes: dict[str, CompiledHash] = collections.defaultdict(CompiledHash)
+    hashes: dict[str, list[Hash]] = field(default_factory=lambda: collections.defaultdict(list))
+    compiled_hashes: dict[str, CompiledHash] = field(
+        default_factory=lambda: collections.defaultdict(DetailsLogger.CompiledHash)
+    )
 
     # dict of details for each task, i.e. winogrande: [example1_details, example2_details, ...]
-    details: dict[str, list[Detail]] = collections.defaultdict(list)
-    compiled_details: dict[str, CompiledDetail] = collections.defaultdict(CompiledDetail)
-    compiled_details_over_all_tasks: CompiledDetailOverAllTasks = CompiledDetailOverAllTasks()
+    details: dict[str, list[Detail]] = field(default_factory=lambda: collections.defaultdict(list))
+    compiled_details: dict[str, CompiledDetail] = field(
+        default_factory=lambda: collections.defaultdict(DetailsLogger.CompiledDetail)
+    )
+    compiled_details_over_all_tasks: CompiledDetailOverAllTasks = field(default_factory=CompiledDetailOverAllTasks)
 
     def log(
         self,
         task_name: str,
         task: LightevalTask,
         doc: Doc,
-        outputs: list[ModelReturn],
+        outputs: list[ModelResponse],
         metrics: dict,
         llm_as_prompt_judgement: Optional[tuple[str, str]] = None,
     ) -> None:
@@ -318,7 +327,7 @@ class DetailsLogger:
             task_name (str): Name of the current task of interest.
             task (LightevalTask): Current task of interest.
             doc (Doc): Current sample that we want to store.
-            outputs (list[ModelReturn]): Model outputs for the current sample
+            outputs (list[ModelResponse]): Model outputs for the current sample
             metrics (_type_): Model scores for said sample on the current task's metrics.
             llm_as_prompt_judgement (tuple[str, str]): Tuple containing the
                 prompt passed to the judge and the judgement for the current sample when using llm-as-judge metric.
@@ -367,6 +376,11 @@ class DetailsLogger:
         if task.has_metric_category[MetricCategory.MULTICHOICE_ONE_TOKEN]:
             detail.choices = doc.choices
             detail.gold_index = as_list(doc.gold_index)
+            pred_saved = True
+        if task.has_metric_category[MetricCategory.MULTICHOICE_PMI]:
+            detail.choices = doc.choices
+            detail.gold_index = as_list(doc.gold_index)
+            doc.specific = {**(doc.specific or {}), **{"unconditioned_query": doc.unconditioned_query}}
             pred_saved = True
         if (
             task.has_metric_category[MetricCategory.LLM_AS_JUDGE_MULTI_TURN]
@@ -450,6 +464,7 @@ class DetailsLogger:
         )
 
 
+@dataclass
 class MetricsLogger:
     """Logs the actual scores for each metric of each task.
 
@@ -460,8 +475,12 @@ class MetricsLogger:
             Example: {"winogrande|winogrande_xl": {"accuracy": 0.5}}
     """
 
-    metrics_values: dict[str, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
-    metric_aggregated: dict[str, dict[str, float]] = collections.defaultdict(lambda: collections.defaultdict(dict))
+    metrics_values: dict[str, dict[str, list[float]]] = field(
+        default_factory=lambda: collections.defaultdict(lambda: collections.defaultdict(list))
+    )
+    metric_aggregated: dict[str, dict[str, float]] = field(
+        default_factory=lambda: collections.defaultdict(lambda: collections.defaultdict(float))
+    )
 
     def log(self, task_name: str, metrics: dict) -> None:
         for metric_name, metric_value in metrics.items():
@@ -491,7 +510,7 @@ class MetricsLogger:
                 try:
                     metric_result = task.aggregation()[metric_name](metric_values)
                 except OverflowError:
-                    hlog_warn(f"{task_name}, {metric_name} got an OVERFLOW ERROR when aggregating.")
+                    logger.warning(f"{task_name}, {metric_name} got an OVERFLOW ERROR when aggregating.")
                     metric_result = float("nan")
                 except KeyError:
                     continue
@@ -513,7 +532,7 @@ class MetricsLogger:
                     except OverflowError:
                         # Is this need or should we just pass?
                         self.metric_aggregated[task_name][f"{metric_name}_stderr"] = float("nan")
-                        hlog_warn(f"{task_name}, {metric_name} got an OVERFLOW ERROR when computing stderr.")
+                        logger.warning(f"{task_name}, {metric_name} got an OVERFLOW ERROR when computing stderr.")
 
         # We group subtasks which belong to the same parent task, like MMLU, to compute an average on them
         # and compute an average of all metrics
@@ -546,6 +565,7 @@ class MetricsLogger:
         self.metric_aggregated["all"] = suite_average
 
 
+@dataclass
 class VersionsLogger:
     """Logger of the tasks versions.
 
@@ -558,12 +578,13 @@ class VersionsLogger:
 
     # the versions dict will be a dict of task_name: task_version
     # {"winogrande|winogrande_xl": 0}
-    versions: dict[str, int] = {}
+    versions: dict[str, int] = field(default_factory=dict)
 
     def log(self, task_name: str, task_version: int) -> None:
         self.versions[task_name] = task_version
 
 
+@dataclass
 class TaskConfigLogger:
     """Logs the different parameters of the current [`LightevalTask`] of interest.
 
@@ -572,7 +593,7 @@ class TaskConfigLogger:
 
     """
 
-    tasks_configs: dict[str, LightevalTaskConfig] = {}
+    tasks_configs: dict[str, LightevalTaskConfig] = field(default_factory=dict)
 
     def log(self, task_dict: dict[str, LightevalTask]) -> None:
         self.tasks_configs = {name: task.cfg for name, task in task_dict.items()}

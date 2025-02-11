@@ -20,45 +20,53 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+import logging
+from typing import Union
 
-from lighteval.logging.hierarchical_logger import hlog
-from lighteval.models.adapter_model import AdapterModel
-from lighteval.models.base_model import BaseModel
-from lighteval.models.delta_model import DeltaModel
-from lighteval.models.endpoint_model import InferenceEndpointModel
-from lighteval.models.model_config import (
-    AdapterModelConfig,
-    BaseModelConfig,
-    DeltaModelConfig,
-    EnvConfig,
+from lighteval.models.dummy.dummy_model import DummyModel, DummyModelConfig
+from lighteval.models.endpoints.endpoint_model import (
+    InferenceEndpointModel,
     InferenceEndpointModelConfig,
-    InferenceModelConfig,
-    TGIModelConfig,
+    ServerlessEndpointModelConfig,
 )
-from lighteval.models.tgi_model import ModelClient
-from lighteval.utils import NO_TGI_ERROR_MSG, is_accelerate_available, is_tgi_available
+from lighteval.models.endpoints.openai_model import OpenAIClient, OpenAIModelConfig
+from lighteval.models.endpoints.tgi_model import ModelClient, TGIModelConfig
+from lighteval.models.litellm_model import LiteLLMClient, LiteLLMModelConfig
+from lighteval.models.transformers.adapter_model import AdapterModel, AdapterModelConfig
+from lighteval.models.transformers.delta_model import DeltaModel, DeltaModelConfig
+from lighteval.models.transformers.transformers_model import TransformersModel, TransformersModelConfig
+from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
+from lighteval.utils.imports import (
+    NO_LITELLM_ERROR_MSG,
+    NO_TGI_ERROR_MSG,
+    NO_VLLM_ERROR_MSG,
+    is_litellm_available,
+    is_openai_available,
+    is_tgi_available,
+    is_vllm_available,
+)
+from lighteval.utils.utils import EnvConfig
 
 
-if is_accelerate_available():
-    from accelerate.utils import calculate_maximum_sizes, convert_bytes
-
-
-@dataclass
-class ModelInfo:
-    model_name: str
-    model_sha: Optional[str] = None
-    model_dtype: Optional[str] = None
-    model_size: Optional[str] = None
+logger = logging.getLogger(__name__)
 
 
 def load_model(  # noqa: C901
-    config: Union[BaseModelConfig, AdapterModelConfig, DeltaModelConfig, TGIModelConfig, InferenceEndpointModelConfig],
+    config: Union[
+        TransformersModelConfig,
+        AdapterModelConfig,
+        DeltaModelConfig,
+        TGIModelConfig,
+        InferenceEndpointModelConfig,
+        DummyModelConfig,
+        VLLMModelConfig,
+        OpenAIModelConfig,
+        LiteLLMModelConfig,
+    ],
     env_config: EnvConfig,
-) -> Tuple[Union[BaseModel, AdapterModel, DeltaModel, ModelClient], ModelInfo]:
-    """Will load either a model from an inference server or a model from a checkpoint. depending
-    on the arguments passed to the program.
+) -> Union[TransformersModel, AdapterModel, DeltaModel, ModelClient, DummyModel]:
+    """Will load either a model from an inference server or a model from a checkpoint, depending
+    on the config type.
 
     Args:
         args (Namespace): arguments passed to the program
@@ -70,74 +78,84 @@ def load_model(  # noqa: C901
         ValueError: If you did not specify a base model when using delta weights or adapter weights
 
     Returns:
-        Union[BaseModel, AdapterModel, DeltaModel, ModelClient]: The model that will be evaluated
+        Union[TransformersModel, AdapterModel, DeltaModel, ModelClient]: The model that will be evaluated
     """
     # Inference server loading
     if isinstance(config, TGIModelConfig):
         return load_model_with_tgi(config)
 
-    if isinstance(config, InferenceEndpointModelConfig) or isinstance(config, InferenceModelConfig):
+    if isinstance(config, InferenceEndpointModelConfig) or isinstance(config, ServerlessEndpointModelConfig):
         return load_model_with_inference_endpoints(config, env_config=env_config)
 
-    if isinstance(config, BaseModelConfig):
+    if isinstance(config, TransformersModelConfig):
         return load_model_with_accelerate_or_default(config=config, env_config=env_config)
+
+    if isinstance(config, DummyModelConfig):
+        return load_dummy_model(config=config, env_config=env_config)
+
+    if isinstance(config, VLLMModelConfig):
+        return load_model_with_accelerate_or_default(config=config, env_config=env_config)
+
+    if isinstance(config, OpenAIModelConfig):
+        return load_openai_model(config=config, env_config=env_config)
+
+    if isinstance(config, LiteLLMModelConfig):
+        return load_litellm_model(config=config, env_config=env_config)
 
 
 def load_model_with_tgi(config: TGIModelConfig):
     if not is_tgi_available():
         raise ImportError(NO_TGI_ERROR_MSG)
 
-    hlog(f"Load model from inference server: {config.inference_server_address}")
-    model = ModelClient(address=config.inference_server_address, auth_token=config.inference_server_auth)
-    model_name = str(model.model_info["model_id"])
-    model_sha = model.model_info["model_sha"]
-    model_precision = model.model_info["dtype"]
-    model_size = -1
-    model_info = ModelInfo(
-        model_name=model_name,
-        model_sha=model_sha,
-        model_dtype=model_precision,
-        model_size=model_size,
+    logger.info(f"Load model from inference server: {config.inference_server_address}")
+    model = ModelClient(
+        address=config.inference_server_address, auth_token=config.inference_server_auth, model_id=config.model_id
     )
-    return model, model_info
+    return model
 
 
-def load_model_with_inference_endpoints(config: InferenceEndpointModelConfig, env_config: EnvConfig):
-    hlog("Spin up model using inference endpoint.")
+def load_litellm_model(config: LiteLLMModelConfig, env_config: EnvConfig):
+    if not is_litellm_available():
+        raise ImportError(NO_LITELLM_ERROR_MSG)
+
+    model = LiteLLMClient(config, env_config)
+    return model
+
+
+def load_openai_model(config: OpenAIModelConfig, env_config: EnvConfig):
+    if not is_openai_available():
+        raise ImportError()
+
+    model = OpenAIClient(config, env_config)
+
+    return model
+
+
+def load_model_with_inference_endpoints(
+    config: Union[InferenceEndpointModelConfig, ServerlessEndpointModelConfig], env_config: EnvConfig
+):
+    logger.info("Spin up model using inference endpoint.")
     model = InferenceEndpointModel(config=config, env_config=env_config)
-    model_info = ModelInfo(
-        model_name=model.name,
-        model_sha=model.revision,
-        model_dtype=config.model_dtype or "default",
-        model_size=-1,
-    )
-    return model, model_info
+    return model
 
 
 def load_model_with_accelerate_or_default(
-    config: Union[AdapterModelConfig, BaseModelConfig, DeltaModelConfig], env_config: EnvConfig
+    config: Union[AdapterModelConfig, TransformersModelConfig, DeltaModelConfig], env_config: EnvConfig
 ):
     if isinstance(config, AdapterModelConfig):
         model = AdapterModel(config=config, env_config=env_config)
     elif isinstance(config, DeltaModelConfig):
         model = DeltaModel(config=config, env_config=env_config)
+    elif isinstance(config, VLLMModelConfig):
+        if not is_vllm_available():
+            raise ImportError(NO_VLLM_ERROR_MSG)
+        model = VLLMModel(config=config, env_config=env_config)
+        return model
     else:
-        model = BaseModel(config=config, env_config=env_config)
+        model = TransformersModel(config=config, env_config=env_config)
 
-    model_name = model.model_name
-    model_sha = model.model_sha
-    model_precision = str(model.precision)
-    if is_accelerate_available():
-        model_size, _ = calculate_maximum_sizes(model.model)
-        model_size = convert_bytes(model_size)
-    else:
-        model_size = -1
-    model_info = ModelInfo(
-        model_name=model_name,
-        model_sha=model_sha,
-        model_dtype=model_precision,
-        model_size=model_size,
-    )
-    hlog(f"Model info: {model_info}")
+    return model
 
-    return model, model_info
+
+def load_dummy_model(config: DummyModelConfig, env_config: EnvConfig):
+    return DummyModel(config=config, env_config=env_config)

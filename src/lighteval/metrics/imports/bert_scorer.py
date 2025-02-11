@@ -22,6 +22,7 @@
 # SOFTWARE.
 
 """Simplified version of the BertScorer lib - we only import what we need."""
+import logging
 import os
 import time
 from collections import defaultdict
@@ -31,7 +32,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoTokenizer
 
-from lighteval.logging.hierarchical_logger import hlog, hlog_warn
+
+logger = logging.getLogger(__name__)
 
 
 def padding(arr, pad_token, dtype=torch.long):
@@ -163,7 +165,7 @@ def greedy_cos_idf(
         - :param: `ref_masks` (torch.LongTensor): BxKxK, BERT attention mask for
                    reference sentences.
         - :param: `ref_idf` (torch.Tensor): BxK, idf score of each word
-                   piece in the reference setence
+                   piece in the reference sentence
         - :param: `hyp_embedding` (torch.Tensor):
                    embeddings of candidate sentences, BxKxd,
                    B: batch size, K: longest length, d: bert dimenison
@@ -218,14 +220,14 @@ def greedy_cos_idf(
         F = F.view(L, B)
 
     if torch.any(hyp_zero_mask):
-        hlog_warn(
+        logger.warning(
             "Warning: Empty candidate sentence detected; setting raw BERTscores to 0.",
         )
         P = P.masked_fill(hyp_zero_mask, 0.0)
         R = R.masked_fill(hyp_zero_mask, 0.0)
 
     if torch.any(ref_zero_mask):
-        hlog_warn("Warning: Empty reference sentence detected; setting raw BERTScores to 0.")
+        logger.warning("Empty reference sentence detected; setting raw BERTScores to 0.")
         P = P.masked_fill(ref_zero_mask, 0.0)
         R = R.masked_fill(ref_zero_mask, 0.0)
 
@@ -375,17 +377,14 @@ class BERTScorer:
         self._model_type = model_type
         self._num_layers = num_layers
 
-        # Building model and tokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(model_type)
-        self._model = AutoModel.from_pretrained(model_type)
-        self._model.eval()
-        self._model.to(self.device)
+        # Model and tokenizer are lazily loaded in `score()`.
+        self._tokenizer = None
+        self._model = None
 
         self._idf_dict = None
 
         self._baseline_vals = None
         self.baseline_path = baseline_path
-        self.use_custom_baseline = self.baseline_path is not None
         if self.baseline_path is None:
             self.baseline_path = os.path.join(
                 os.path.dirname(__file__),
@@ -443,6 +442,13 @@ class BERTScorer:
                       the *best* score among all references.
         """
 
+        if self._model is None:
+            logger.info(f"Loading BERTScorer model `{self._model_type}`")
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_type)
+            self._model = AutoModel.from_pretrained(self._model_type)
+            self._model.eval()
+            self._model.to(self.device)
+
         ref_group_boundaries = None
         if not isinstance(refs[0], str):
             ref_group_boundaries = []
@@ -456,7 +462,7 @@ class BERTScorer:
                 count += len(ref_group)
 
         if verbose:
-            hlog("calculating scores...")
+            logger.info("calculating scores...")
             start = time.perf_counter()
 
         if self.idf:
@@ -492,6 +498,6 @@ class BERTScorer:
 
         if verbose:
             time_diff = time.perf_counter() - start
-            hlog(f"done in {time_diff:.2f} seconds, {len(refs) / time_diff:.2f} sentences/sec")
+            logger.info(f"done in {time_diff:.2f} seconds, {len(refs) / time_diff:.2f} sentences/sec")
 
         return out

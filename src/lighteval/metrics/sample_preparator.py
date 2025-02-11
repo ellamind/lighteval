@@ -20,12 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging
 import re
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from lighteval.logging.hierarchical_logger import hlog_warn
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,6 +57,7 @@ class PerplexityCorpusMetricInput(CorpusMetricInput):
 
 
 class GenerativePreparator:
+    @staticmethod
     def prepare(golds: list[str], predictions: list[str], **kwargs):
         """Prepares an individual generative example to the format expected by metrics computed at the corpus level (aggregated).
 
@@ -91,7 +94,7 @@ class LoglikelihoodPreparator:
         """
         if self.is_single_token:
             if len(gold_ixs) > 1:
-                hlog_warn(
+                logger.warning(
                     "The current sample has more than one gold available, which is unexpected. We selected only the first one for the corpus aggregation of the loglikelihood metric."
                 )
             return LogprobCorpusMetricInput(golds=gold_ixs[0], preds=np.argmax(choices_logprob))
@@ -128,7 +131,7 @@ class PerplexityPreparator:
         if self.units_type == "bytes":
             return len(text.encode("utf-8"))
 
-    def prepare(self, logprobs: list[float] | float, reference_text: str, **kwargs):
+    def prepare(self, logprobs: list[float], reference_texts: list[str], **kwargs):
         """Prepares an individual perplexity example to the format expected by metrics computed at the corpus level (aggregated).
 
         Args:
@@ -138,4 +141,7 @@ class PerplexityPreparator:
         Returns:
             PerplexityCorpusMetricInput: Stores the measured logprobs and associated text lengths, counted in the reference unit.
         """
-        return PerplexityCorpusMetricInput(logprobs=logprobs, weights=self.count_units(reference_text))
+
+        logprobs_flat = np.sum(logprobs)
+        reference_text_flat = " ".join(reference_texts)
+        return PerplexityCorpusMetricInput(logprobs=logprobs_flat, weights=self.count_units(reference_text_flat))
