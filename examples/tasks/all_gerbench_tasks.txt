@@ -1,0 +1,2 @@
+community|gerbench:sentence_errors|0|0
+community|gerbench:next_word|0|0
